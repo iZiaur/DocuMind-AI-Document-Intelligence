@@ -1,12 +1,12 @@
 import os
 import uuid
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from pypdf import PdfReader
 from sqlalchemy.orm import Session
 
 from backend.models import Document, DocumentChunk
-from backend.embeddings import get_embeddings_batch
+from backend.embeddings import get_embeddings_batch, get_embedding_space_id
 
 # Chunking Strategy Configuration
 DEFAULT_CHUNK_SIZE = 800       # Target characters per chunk (~150-200 words)
@@ -160,6 +160,8 @@ def process_document_pipeline(document_id: str, db: Session) -> Document:
         # Idempotency guard: Clear any prior chunks for this document if re-processing
         db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete()
 
+        active_space = get_embedding_space_id()
+
         # Insert new chunks
         for idx, (chunk_data, embedding) in enumerate(zip(all_chunks, embeddings)):
             chunk_record = DocumentChunk(
@@ -169,6 +171,7 @@ def process_document_pipeline(document_id: str, db: Session) -> Document:
                 page_number=chunk_data["page_number"],
                 text=chunk_data["text"],
                 embedding=embedding,
+                embedding_space=active_space,
             )
             db.add(chunk_record)
 
@@ -187,4 +190,64 @@ def process_document_pipeline(document_id: str, db: Session) -> Document:
             failed_doc.error_message = str(err)
             db.commit()
             db.refresh(failed_doc)
+        raise err
+
+
+def reembed_document(
+    document_id: str,
+    db: Session,
+    target_space: Optional[str] = None,
+) -> Document:
+    """
+    Safely and transactionally re-embeds all existing chunks of a document
+    into the active (or specified) embedding space without data loss.
+
+    Key Safety Properties:
+    1. Preserves chunk IDs, page numbers, chunk indices, and text boundaries exactly.
+    2. Concurrency-safe: Locks document row on PostgreSQL during re-embedding.
+    3. Provider-aligned: Guarantees embeddings are generated using the exact provider/model of target_space.
+    4. Atomic: Uses nested savepoint. If embedding generation fails (e.g. provider error),
+       the database rolls back completely to the pre-reembed state.
+    5. Preserves document ownership, title, and citation metadata.
+    """
+    doc_query = db.query(Document).filter(Document.id == document_id)
+    if db.bind and db.bind.dialect.name != "sqlite":
+        doc_query = doc_query.with_for_update()
+    document = doc_query.first()
+    if not document:
+        raise ValueError(f"Document {document_id} not found.")
+
+    chunks = (
+        db.query(DocumentChunk)
+        .filter(DocumentChunk.document_id == document_id)
+        .order_by(DocumentChunk.chunk_index)
+        .all()
+    )
+    if not chunks:
+        raise ValueError(f"Document {document_id} has no chunks to re-embed.")
+
+    dest_space = target_space or get_embedding_space_id()
+    # Parse target provider and model from dest_space format 'provider:model:dimension'
+    parts = dest_space.split(":")
+    dest_provider = parts[0] if len(parts) >= 1 else None
+    dest_model = parts[1] if len(parts) >= 2 else None
+
+    chunk_texts = [c.text for c in chunks]
+
+    # Generate new embeddings strictly using the target provider and model
+    new_embeddings = get_embeddings_batch(chunk_texts, provider=dest_provider, model=dest_model)
+
+    # Apply atomic transaction update
+    try:
+        with db.begin_nested():
+            for chunk, new_emb in zip(chunks, new_embeddings):
+                chunk.embedding = new_emb
+                chunk.embedding_space = dest_space
+            document.status = "completed"
+            document.error_message = None
+        db.commit()
+        db.refresh(document)
+        return document
+    except Exception as err:
+        db.rollback()
         raise err

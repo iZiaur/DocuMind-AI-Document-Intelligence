@@ -12,3 +12,4 @@ pyjwt>=2.9.0
 python-multipart>=0.0.12
 pypdf>=5.0.0
 email-validator>=2.2.0
+alembic>=1.13.0

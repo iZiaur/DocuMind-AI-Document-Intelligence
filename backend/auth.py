@@ -14,12 +14,83 @@ from backend.models import User
 load_dotenv()
 
 # Security Configurations
-JWT_SECRET = os.getenv("JWT_SECRET", "documind_super_secret_jwt_key_for_development_change_in_production")
+INSECURE_DEV_JWT_SECRET = "documind_super_secret_jwt_key_for_development_change_in_production"
+MIN_JWT_SECRET_LENGTH = 32  # Minimum 256 bits of entropy required for HS256
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
 # FastAPI Bearer token extractor
 security = HTTPBearer(auto_error=False)
+
+
+def is_test_or_development_mode() -> bool:
+    """
+    Determines whether the application is running under pytest or explicit local development.
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return True
+    documind_env = os.getenv("DOCUMIND_ENV", "").strip().lower()
+    if documind_env in ("development", "dev", "test", "testing"):
+        return True
+    app_env = os.getenv("ENVIRONMENT", "").strip().lower()
+    if app_env in ("development", "dev", "test", "testing"):
+        return True
+    return False
+
+
+def get_jwt_secret() -> str:
+    """
+    Retrieves and validates the JWT secret key.
+
+    Security Policy (SEC-01):
+    1. Reads strictly from JWT_SECRET environment variable.
+    2. In production (non-test/non-dev):
+       - Refuses to start if JWT_SECRET is missing or empty.
+       - Refuses to start if JWT_SECRET equals the insecure development placeholder.
+       - Refuses to start if len(JWT_SECRET) < 32 characters.
+    3. In explicit test/development mode:
+       - Allows the development secret or a deterministic test key if unset.
+    4. Never prints or logs the secret value.
+    """
+    secret = os.getenv("JWT_SECRET", "").strip()
+    is_dev = is_test_or_development_mode()
+
+    if not secret:
+        if is_dev:
+            return INSECURE_DEV_JWT_SECRET
+        raise RuntimeError(
+            "CRITICAL SECURITY CONFIGURATION ERROR: JWT_SECRET environment variable is missing or empty. "
+            "DocuMind AI refuses to start without a cryptographically secure JWT secret."
+        )
+
+    if not is_dev:
+        if secret == INSECURE_DEV_JWT_SECRET:
+            raise RuntimeError(
+                "CRITICAL SECURITY CONFIGURATION ERROR: Insecure default JWT_SECRET detected in production. "
+                "You must configure a unique, high-entropy secret in your environment."
+            )
+        if len(secret) < MIN_JWT_SECRET_LENGTH:
+            raise RuntimeError(
+                f"CRITICAL SECURITY CONFIGURATION ERROR: JWT_SECRET is insufficiently strong ({len(secret)} characters). "
+                f"It must be at least {MIN_JWT_SECRET_LENGTH} characters for HS256 security."
+            )
+
+    return secret
+
+
+def validate_jwt_secret() -> None:
+    """Validates the JWT secret at application startup."""
+    get_jwt_secret()
+
+
+# Backwards compatibility alias for module-level readers
+def _get_active_secret() -> str:
+    try:
+        return get_jwt_secret()
+    except RuntimeError:
+        return ""
+
+JWT_SECRET = _get_active_secret()
 
 
 def hash_password(password: str) -> str:
@@ -62,7 +133,8 @@ def create_access_token(user_id: int, username: str, expires_delta: Optional[tim
         "iat": datetime.now(timezone.utc),
     }
 
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    secret = get_jwt_secret()
+    return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
 def decode_access_token(token: str) -> Dict[str, Any]:
@@ -71,7 +143,8 @@ def decode_access_token(token: str) -> Dict[str, Any]:
     Raises HTTPException(401) on expiration or signature tampering.
     """
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        secret = get_jwt_secret()
+        payload = jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(

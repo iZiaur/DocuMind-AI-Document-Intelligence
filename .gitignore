@@ -51,3 +51,12 @@ yarn-error.log*
 *.swo
 .DS_Store
 Thumbs.db
+
+# Database backups & local SQL dumps
+backup_checkpoint12.sql
+*.sqlite3
+
+# Benchmark & temporary evaluation outputs
+eval_results.json
+backend/evaluation/*.json
+!backend/evaluation/dataset.json

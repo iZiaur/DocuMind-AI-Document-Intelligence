@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from pypdf import PdfWriter
 
-from backend.models import Base, Document, DocumentChunk
+from backend.models import Base, User, Document, DocumentChunk
 from backend.main import app, get_db
 from backend.auth import create_access_token
 from backend.embeddings import get_embedding, get_embeddings_batch, EMBEDDING_DIMENSION
@@ -47,6 +47,16 @@ def setup_test_database():
 def client():
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def db_session():
+    """Provides a dedicated database session for test operations."""
+    db = TestingSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def create_pdf_with_text(pages_text: list[str]) -> bytes:
@@ -817,3 +827,741 @@ def test_rag_provider_generic_exception_does_not_leak_internal_details(monkeypat
     assert res.insufficient_evidence is True
     assert len(res.citations) == 0
 
+
+# ---------------------------------------------------------------------------
+# Stage 7 Checkpoint B: Hybrid Retrieval Targeted Regression Tests
+# ---------------------------------------------------------------------------
+
+def test_hybrid_retrieval_exact_keyword_and_numeric_matching(db_session):
+    """
+    Test 1: Verifies exact keyword and numeric matching for domain terms:
+    'Severity-1', '15 minutes', 'SOC 2', and 'per diem'.
+    """
+    from backend.retrieval import compute_lexical_score, tokenize_lexical
+    from backend.main import retrieve_authorized_passages
+
+    # 1. Tokenizer preserves compounds and numbers
+    t1 = tokenize_lexical("Severity-1 incident in 15 minutes")
+    assert "severity-1" in t1
+    assert "15" in t1
+    assert "minutes" in t1
+
+    t2 = tokenize_lexical("SOC 2 Type II per diem allowance")
+    assert "soc" in t2
+    assert "2" in t2
+    assert "per" in t2
+    assert "diem" in t2
+
+    # 2. Setup user and document with domain terms
+    user = User(email="hybrid_test@documind.ai", username="hybrid_user", hashed_password="HashPassword123!")
+    db_session.add(user)
+    db_session.commit()
+
+    doc = Document(
+        id="doc-hybrid-01",
+        owner_id=user.id,
+        title="Incident & Travel Policy",
+        filename="policy.pdf",
+        storage_path="mock/path.pdf",
+        file_size_bytes=1024,
+        page_count=2,
+        status="completed",
+    )
+    db_session.add(doc)
+    db_session.commit()
+
+    c1 = DocumentChunk(
+        id="chunk-sev1",
+        document_id=doc.id,
+        chunk_index=0,
+        page_number=1,
+        text="Critical Severity-1 incidents require executive notification within 15 minutes of detection.",
+        embedding=[0.01] * 1536,
+    )
+    c2 = DocumentChunk(
+        id="chunk-perdiem",
+        document_id=doc.id,
+        chunk_index=1,
+        page_number=2,
+        text="The domestic per diem meal allowance is capped at $75 per day under SOC 2 compliance.",
+        embedding=[0.02] * 1536,
+    )
+    db_session.add_all([c1, c2])
+    db_session.commit()
+
+    # Query 1: Severity-1 and 15 minutes
+    res1 = retrieve_authorized_passages(
+        query_text="What is the notification time for Severity-1?",
+        user_id=user.id,
+        top_k=1,
+        document_id=doc.id,
+        db=db_session,
+    )
+    assert len(res1) == 1
+    assert res1[0].chunk_id == "chunk-sev1"
+    assert "15 minutes" in res1[0].text
+    assert res1[0].score > 0.15
+
+    # Query 2: per diem and SOC 2
+    res2 = retrieve_authorized_passages(
+        query_text="What is the domestic per diem under SOC 2?",
+        user_id=user.id,
+        top_k=1,
+        document_id=doc.id,
+        db=db_session,
+    )
+    assert len(res2) == 1
+    assert res2[0].chunk_id == "chunk-perdiem"
+    assert "$75" in res2[0].text
+
+
+def test_hybrid_retrieval_lexical_outranks_misleading_vector(db_session):
+    """
+    Test 2: Verifies that strong lexical evidence outranks a misleading vector match
+    when running in hybrid mode.
+    """
+    from backend.main import retrieve_authorized_passages
+
+    user = User(email="outrank_user@documind.ai", username="outrank_user", hashed_password="HashPassword123!")
+    db_session.add(user)
+    db_session.commit()
+
+    doc = Document(id="doc-outrank", owner_id=user.id, title="Doc", filename="d.pdf", storage_path="p", file_size_bytes=100, page_count=1, status="completed")
+    db_session.add(doc)
+    db_session.commit()
+
+    # Chunk A: Has high pseudo-vector alignment but irrelevant text
+    c_misleading = DocumentChunk(
+        id="chunk-misleading",
+        document_id=doc.id,
+        chunk_index=0,
+        page_number=1,
+        text="Unrelated boilerplate legal disclaimer regarding copyright and trademarks.",
+        embedding=[0.99] * 1536,  # Artificially high vector
+    )
+    # Chunk B: Has the actual substantive answer with exact keywords
+    c_relevant = DocumentChunk(
+        id="chunk-relevant",
+        document_id=doc.id,
+        chunk_index=1,
+        page_number=1,
+        text="Root Cause Analysis (RCA) documents must be finalized and submitted within 72 hours.",
+        embedding=[0.05] * 1536,
+    )
+    db_session.add_all([c_misleading, c_relevant])
+    db_session.commit()
+
+    results = retrieve_authorized_passages(
+        query_text="How quickly must the Root Cause Analysis (RCA) be submitted?",
+        user_id=user.id,
+        top_k=2,
+        document_id=doc.id,
+        db=db_session,
+    )
+    assert len(results) == 2
+    # The relevant chunk must outrank the misleading vector match due to lexical grounding
+    assert results[0].chunk_id == "chunk-relevant"
+    assert "72 hours" in results[0].text
+
+
+def test_hybrid_retrieval_empty_and_punctuation_safety(db_session):
+    """
+    Test 3: Handles empty queries, punctuation-only queries, and empty chunk text safely without error.
+    """
+    from backend.retrieval import compute_lexical_score
+    from backend.main import retrieve_authorized_passages
+
+    assert compute_lexical_score("", "some text") == 0.0
+    assert compute_lexical_score("query", "") == 0.0
+    assert compute_lexical_score("   ", "some text") == 0.0
+    assert compute_lexical_score("???!!!...", "some text") == 0.0
+
+    user = User(email="safe_q@documind.ai", username="safe_user", hashed_password="HashPassword123!")
+    db_session.add(user)
+    db_session.commit()
+
+    # Empty query returns safely
+    passages = retrieve_authorized_passages(
+        query_text="???",
+        user_id=user.id,
+        top_k=3,
+        document_id=None,
+        db=db_session,
+    )
+    assert isinstance(passages, list)
+
+
+def test_hybrid_retrieval_deterministic_tie_breaking(db_session):
+    """
+    Test 4: Verifies deterministic ranking when hybrid scores tie.
+    """
+    from backend.main import retrieve_authorized_passages
+
+    user = User(email="tie_user@documind.ai", username="tie_user", hashed_password="HashPassword123!")
+    db_session.add(user)
+    db_session.commit()
+
+    doc = Document(id="doc-tie", owner_id=user.id, title="Doc", filename="d.pdf", storage_path="p", file_size_bytes=100, page_count=1, status="completed")
+    db_session.add(doc)
+    db_session.commit()
+
+    c_alpha = DocumentChunk(id="chunk-aaa", document_id=doc.id, chunk_index=0, page_number=1, text="Identical text content.", embedding=[0.1] * 1536)
+    c_beta = DocumentChunk(id="chunk-zzz", document_id=doc.id, chunk_index=1, page_number=1, text="Identical text content.", embedding=[0.1] * 1536)
+    db_session.add_all([c_alpha, c_beta])
+    db_session.commit()
+
+    # Query multiple times
+    res_1 = retrieve_authorized_passages("Identical text", user.id, 2, doc.id, db_session)
+    res_2 = retrieve_authorized_passages("Identical text", user.id, 2, doc.id, db_session)
+
+    order_1 = [p.chunk_id for p in res_1]
+    order_2 = [p.chunk_id for p in res_2]
+    assert order_1 == order_2  # Strictly deterministic order
+
+
+def test_hybrid_retrieval_unauthorized_chunks_never_returned(db_session):
+    """
+    Test 5: Verifies multi-tenant isolation: unauthorized user chunks are never returned,
+    even if their text has a 100% exact keyword match.
+    """
+    from backend.main import retrieve_authorized_passages
+
+    user_a = User(email="owner_a@documind.ai", username="owner_a", hashed_password="HashPassword123!")
+    user_b = User(email="owner_b@documind.ai", username="owner_b", hashed_password="HashPassword123!")
+    db_session.add_all([user_a, user_b])
+    db_session.commit()
+
+    doc_b = Document(id="doc-secret-b", owner_id=user_b.id, title="Top Secret", filename="secret.pdf", storage_path="p", file_size_bytes=100, page_count=1, status="completed")
+    db_session.add(doc_b)
+    db_session.commit()
+
+    c_b = DocumentChunk(
+        id="chunk-secret-b",
+        document_id=doc_b.id,
+        chunk_index=0,
+        page_number=1,
+        text="Target Confidential Passcode: X99-ALPHA-OMEGA",
+        embedding=[0.5] * 1536,
+    )
+    db_session.add(c_b)
+    db_session.commit()
+
+    # User A queries for User B's exact content
+    results = retrieve_authorized_passages("Target Confidential Passcode X99-ALPHA-OMEGA", user_a.id, 5, None, db_session)
+    assert len(results) == 0  # Completely unauthorized, 0 chunks returned
+
+
+def test_hybrid_retrieval_citation_metadata_intact(db_session):
+    """
+    Test 6: Verifies that SearchPassageResponse preserves all necessary citation attributes
+    and includes retrieval diagnostics in metadata.
+    """
+    from backend.main import retrieve_authorized_passages
+
+    user = User(email="meta_user@documind.ai", username="meta_user", hashed_password="HashPassword123!")
+    db_session.add(user)
+    db_session.commit()
+
+    doc = Document(id="doc-meta-01", owner_id=user.id, title="Engineering Standard", filename="eng.pdf", storage_path="p", file_size_bytes=200, page_count=3, status="completed")
+    db_session.add(doc)
+    db_session.commit()
+
+    c = DocumentChunk(id="chunk-meta-01", document_id=doc.id, chunk_index=4, page_number=3, text="Code review standard requires two senior approvers.", embedding=[0.2] * 1536)
+    db_session.add(c)
+    db_session.commit()
+
+    passages = retrieve_authorized_passages("Code review standard", user.id, 1, doc.id, db_session)
+    assert len(passages) == 1
+    p = passages[0]
+
+    assert p.chunk_id == "chunk-meta-01"
+    assert p.document_id == "doc-meta-01"
+    assert p.document_title == "Engineering Standard"
+    assert p.page_number == 3
+    assert p.chunk_index == 4
+    assert "retrieval_mode" in p.metadata
+    assert p.metadata["retrieval_mode"] == "hybrid"
+    assert "vector_similarity" in p.metadata
+    assert "lexical_score" in p.metadata
+
+
+def test_hybrid_retrieval_live_vector_compatibility(monkeypatch):
+    """
+    Test 7: Tests live-vector compatibility using a controlled test double to verify
+    weighting configuration adapts when live credentials/providers are active.
+    """
+    from backend.retrieval import get_hybrid_alpha, compute_hybrid_score
+
+    # Without live provider (offline): default offline alpha is 0.2
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "offline")
+    assert get_hybrid_alpha() == 0.2
+
+    # With live provider (openai or gemini): default live alpha is 0.5
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    assert get_hybrid_alpha() == 0.5
+
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "gemini")
+    assert get_hybrid_alpha() == 0.5
+
+    # Respects explicit environment override
+    monkeypatch.setenv("HYBRID_RETRIEVAL_ALPHA", "0.65")
+    assert get_hybrid_alpha() == 0.65
+
+    # Linear combination computation
+    score = compute_hybrid_score(vector_similarity=0.8, lexical_similarity=0.4, alpha=0.5)
+    assert score == pytest.approx(0.60, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 Checkpoint C: Evidence Sufficiency and Abstention Regression Tests
+# ---------------------------------------------------------------------------
+
+def test_evidence_sufficiency_supported_numeric_answer():
+    """
+    Test 1: Supported question with specific numeric answer.
+    Verifies that supported facts with numbers ($75 per day) are answered with citations.
+    """
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-num-01",
+        document_id="doc-travel",
+        document_title="Corporate Travel Policy",
+        page_number=2,
+        chunk_index=1,
+        text="The maximum allowable domestic per diem for meals is capped at $75 per day.",
+        score=0.85,
+        metadata={},
+    )
+
+    res = generate_rag_answer(
+        question="What is the maximum domestic per diem cap for daily meal expenses?",
+        passages=[passage],
+    )
+    assert res.insufficient_evidence is False
+    assert "$75" in res.answer
+    assert len(res.citations) == 1
+    assert res.citations[0].chunk_id == "chunk-num-01"
+
+
+def test_evidence_sufficiency_unanswerable_generic_term_sharing():
+    """
+    Test 2: Unanswerable question that shares generic terms with retrieved passages.
+    Passages discuss general corporate travel policies, but question asks for gym memberships.
+    Verifies clean abstention with 0 citations.
+    """
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-generic-01",
+        document_id="doc-travel",
+        document_title="Corporate Travel Policy",
+        page_number=2,
+        chunk_index=1,
+        text="Corporate policy regulates allowable travel reimbursement, lodging rates, and meal expenses.",
+        score=0.35,
+        metadata={},
+    )
+
+    res = generate_rag_answer(
+        question="What is the corporate reimbursement limit for personal gym memberships and fitness wellness programs?",
+        passages=[passage],
+    )
+    assert res.insufficient_evidence is True
+    assert "insufficient" in res.answer.lower()
+    assert len(res.citations) == 0
+
+
+def test_evidence_sufficiency_technical_identifier_absent():
+    """
+    Test 3: Question requests a technical identifier (Severity-4) absent from evidence,
+    even though related tiers (Severity-1, Severity-2) are present.
+    Verifies system abstains rather than falsely substituting Severity-1.
+    """
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-sec-01",
+        document_id="doc-sec",
+        document_title="Incident Response Policy",
+        page_number=1,
+        chunk_index=0,
+        text="Critical Severity-1 incidents require executive notification within 15 minutes. Major Severity-2 incidents require notification within 30 minutes.",
+        score=0.65,
+        metadata={},
+    )
+
+    res = generate_rag_answer(
+        question="What is the executive notification deadline for Severity-4 informational security notices?",
+        passages=[passage],
+    )
+    assert res.insufficient_evidence is True
+    assert len(res.citations) == 0
+    assert "15 minutes" not in res.answer
+
+
+def test_evidence_sufficiency_partially_answerable_multipart_question():
+    """
+    Test 4: Partially answerable multi-part question:
+    Clause 1 (peer reviews) is supported, Clause 2 (employee stock vesting) is unsupported.
+    Verifies supported part is answered with citations, and unsupported part is explicitly identified.
+    """
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-eng-01",
+        document_id="doc-eng",
+        document_title="Engineering Guide",
+        page_number=1,
+        chunk_index=0,
+        text="All production pull requests require passing automated tests and at least two peer code reviews before merge.",
+        score=0.80,
+        metadata={},
+    )
+
+    res = generate_rag_answer(
+        question="What are the peer review requirements for pull requests and what is the employee stock options vesting schedule?",
+        passages=[passage],
+    )
+    assert res.insufficient_evidence is False
+    assert "peer code reviews" in res.answer.lower()
+    assert "not address" in res.answer.lower() or "insufficient" in res.answer.lower()
+    assert len(res.citations) == 1
+    assert res.citations[0].chunk_id == "chunk-eng-01"
+
+
+def test_evidence_sufficiency_conflicting_passages():
+    """
+    Test 5: Conflicting passages that must not produce an invented resolution.
+    Passage A says deployments on Fridays are prohibited; Passage B says deployments on Fridays are permitted.
+    Verifies that the conflict is communicated and citations cite both sources.
+    """
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    p1 = SearchPassageResponse(
+        chunk_id="chunk-conf-01",
+        document_id="doc-1",
+        document_title="Deployment Guide 2023",
+        page_number=1,
+        chunk_index=0,
+        text="Production deployments on Fridays are strictly prohibited after 2:00 PM.",
+        score=0.75,
+        metadata={},
+    )
+    p2 = SearchPassageResponse(
+        chunk_id="chunk-conf-02",
+        document_id="doc-2",
+        document_title="Emergency Procedure Addendum",
+        page_number=1,
+        chunk_index=0,
+        text="Production deployments on Fridays are permitted and authorized for all critical hotfixes.",
+        score=0.74,
+        metadata={},
+    )
+
+    res = generate_rag_answer(
+        question="Are deployments permitted or prohibited on Fridays?",
+        passages=[p1, p2],
+    )
+    assert res.insufficient_evidence is False
+    assert "conflicting" in res.answer.lower()
+    assert len(res.citations) == 2
+
+
+def test_evidence_sufficiency_valid_answer_low_retrieval_score():
+    """
+    Test 6: Valid answer must NOT be rejected merely because its retrieval score is low.
+    Score = 0.04, but substantive content matches exactly.
+    """
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-low-score",
+        document_id="doc-travel",
+        document_title="Corporate Travel Policy",
+        page_number=3,
+        chunk_index=2,
+        text="Itemized receipts are only mandatory for expenses exceeding $25.",
+        score=0.04,  # Intentionally low retrieval score
+        metadata={},
+    )
+
+    res = generate_rag_answer(
+        question="Are itemized receipts mandatory for taxi rides that cost exactly fifteen dollars?",
+        passages=[passage],
+    )
+    assert res.insufficient_evidence is False
+    assert "receipts" in res.answer.lower()
+    assert len(res.citations) == 1
+
+
+def test_evidence_sufficiency_empty_or_unsupported_evidence_set():
+    """
+    Test 7: Empty or completely off-topic evidence set returns insufficient evidence and 0 citations.
+    """
+    from backend.rag import generate_rag_answer
+
+    res_empty = generate_rag_answer(question="What is the audit log retention policy?", passages=[])
+    assert res_empty.insufficient_evidence is True
+    assert len(res_empty.citations) == 0
+
+
+def test_evidence_sufficiency_refusal_and_citation_compatibility():
+    """
+    Test 8: Existing refusal and citation behavior remains fully compatible.
+    """
+    from backend.rag import is_refusal_or_insufficient_answer, validate_and_extract_citations
+    from backend.models import SearchPassageResponse
+
+    assert is_refusal_or_insufficient_answer("I do not have sufficient information to answer.") is True
+    assert is_refusal_or_insufficient_answer("The documents do not address this question.") is True
+    assert is_refusal_or_insufficient_answer("Severity-1 incidents require notification within 15 minutes.") is False
+
+    p = SearchPassageResponse(
+        chunk_id="chk-comp-01",
+        document_id="doc-1",
+        document_title="Policy",
+        page_number=1,
+        chunk_index=0,
+        text="Normal policy text.",
+        score=0.9,
+        metadata={},
+    )
+    cits, text = validate_and_extract_citations("I cannot answer from available evidence.", [p])
+    assert cits == []
+
+
+def test_evidence_sufficiency_authorization_and_isolation_intact(db_session):
+    """
+    Test 9: Multi-tenant authorization and isolation remain intact.
+    User B cannot retrieve or get an answer from User A's private documents.
+    """
+    from backend.main import retrieve_authorized_passages
+    from backend.rag import generate_rag_answer
+
+    user_a = User(email="iso_a@documind.ai", username="iso_a", hashed_password="HashPassword123!")
+    user_b = User(email="iso_b@documind.ai", username="iso_b", hashed_password="HashPassword123!")
+    db_session.add_all([user_a, user_b])
+    db_session.commit()
+
+    doc_a = Document(id="doc-iso-a", owner_id=user_a.id, title="User A Secret", filename="a.pdf", storage_path="p", file_size_bytes=100, page_count=1, status="completed")
+    db_session.add(doc_a)
+    db_session.commit()
+
+    chunk_a = DocumentChunk(id="chunk-iso-a", document_id=doc_a.id, chunk_index=0, page_number=1, text="Secret master key is 998877.", embedding=[0.3] * 1536)
+    db_session.add(chunk_a)
+    db_session.commit()
+
+    passages = retrieve_authorized_passages("What is the secret master key?", user_b.id, 3, None, db_session)
+    assert len(passages) == 0
+
+    res = generate_rag_answer("What is the secret master key?", passages)
+    assert res.insufficient_evidence is True
+    assert "998877" not in res.answer
+    assert len(res.citations) == 0
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 Checkpoint C.1: Generalization Hardening Regression Tests
+# ---------------------------------------------------------------------------
+
+def test_evidence_sufficiency_numeric_mismatch_abstention():
+    """Checkpoint C.1 Failure A: $5,000 asked, only $500 present -> abstains."""
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-p4",
+        document_id="doc-purchasing",
+        document_title="Purchasing Guide",
+        page_number=1,
+        chunk_index=0,
+        text="Standard employee purchasing card transactions are strictly limited to $500 per transaction.",
+        score=0.85,
+        metadata={},
+    )
+
+    res = generate_rag_answer("What is the expense limit for $5,000 purchases?", [passage])
+    assert res.insufficient_evidence is True
+    assert "insufficient" in res.answer.lower()
+    assert len(res.citations) == 0
+
+
+def test_evidence_sufficiency_identifier_absent_fact_type():
+    """Checkpoint C.1 Failure B: Severity-1 asked for fine amount, only reporting deadline present -> abstains."""
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-p5",
+        document_id="doc-incident",
+        document_title="Incident Policy",
+        page_number=1,
+        chunk_index=0,
+        text="Severity-1 incidents require immediate executive war room activation within 15 minutes.",
+        score=0.88,
+        metadata={},
+    )
+
+    res = generate_rag_answer("What is the Severity-1 incident resolution fine amount payable to regulators?", [passage])
+    assert res.insufficient_evidence is True
+    assert "insufficient" in res.answer.lower()
+    assert len(res.citations) == 0
+
+
+def test_evidence_sufficiency_generic_term_distractor():
+    """Checkpoint C.1 Failure C: Pet dogs in office buildings, only badge access present -> abstains."""
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-p6",
+        document_id="doc-facilities",
+        document_title="Corporate Facility Rules",
+        page_number=1,
+        chunk_index=0,
+        text="Corporate office buildings enforce strict badge access and mandatory visitor registration policy.",
+        score=0.78,
+        metadata={},
+    )
+
+    res = generate_rag_answer("What are the rules regarding employee pet dogs in corporate office buildings?", [passage])
+    assert res.insufficient_evidence is True
+    assert "insufficient" in res.answer.lower()
+    assert len(res.citations) == 0
+
+
+def test_evidence_sufficiency_conflict_detection_query_alignment():
+    """Checkpoint C.1 Failure D: Remote work internet stipends prohibited vs permitted -> conflict detected."""
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    p1 = SearchPassageResponse(
+        chunk_id="chunk-p8a",
+        document_id="doc-r1",
+        document_title="Travel & Remote Policy 2022",
+        page_number=1,
+        chunk_index=0,
+        text="Remote work internet stipends are strictly prohibited for non-exempt staff.",
+        score=0.82,
+        metadata={},
+    )
+    p2 = SearchPassageResponse(
+        chunk_id="chunk-p8b",
+        document_id="doc-r2",
+        document_title="Remote Policy Addendum 2024",
+        page_number=1,
+        chunk_index=0,
+        text="Remote work internet stipends are permitted and authorized up to $50 monthly.",
+        score=0.81,
+        metadata={},
+    )
+
+    res = generate_rag_answer("Are remote work stipends permitted or prohibited?", [p1, p2])
+    assert res.insufficient_evidence is False
+    assert "conflicting" in res.answer.lower()
+    assert len(res.citations) == 2
+
+
+def test_evidence_sufficiency_boundary_numeric_units():
+    """Checkpoint C.1 Boundary: 15 hours requested when only 15 minutes exists -> unit mismatch abstains."""
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-b1",
+        document_id="doc-sec",
+        document_title="Incident Handbook",
+        page_number=1,
+        chunk_index=0,
+        text="Severity-1 incidents require executive notification within 15 minutes of detection.",
+        score=0.89,
+        metadata={},
+    )
+
+    res = generate_rag_answer("Must incident response teams be notified within 15 hours?", [passage])
+    assert res.insufficient_evidence is True
+    assert len(res.citations) == 0
+
+
+def test_evidence_sufficiency_boundary_incidental_numbers():
+    """Checkpoint C.1 Boundary: Incidental number in query (Chapter 1) does not reject supported topic."""
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-b2",
+        document_id="doc-guide",
+        document_title="Operations Guide",
+        page_number=1,
+        chunk_index=0,
+        text="Server updates must be deployed during the weekly maintenance window.",
+        score=0.76,
+        metadata={},
+    )
+
+    res = generate_rag_answer("What is the standard procedure outlined in Chapter 1 for server updates?", [passage])
+    assert res.insufficient_evidence is False
+    assert "server updates" in res.answer.lower()
+    assert len(res.citations) == 1
+
+
+def test_evidence_sufficiency_boundary_multiple_identifiers():
+    """Checkpoint C.1 Boundary: Multiple identifiers where one is absent (Severity-5) -> abstains."""
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    passage = SearchPassageResponse(
+        chunk_id="chunk-b3",
+        document_id="doc-sec",
+        document_title="Incident Handbook",
+        page_number=1,
+        chunk_index=0,
+        text="Severity-1 incidents require 15-minute alerts. Severity-2 incidents require 1-hour alerts.",
+        score=0.85,
+        metadata={},
+    )
+
+    res = generate_rag_answer("What are the policies for Severity-1 and Severity-5?", [passage])
+    assert res.insufficient_evidence is True
+    assert len(res.citations) == 0
+
+
+def test_evidence_sufficiency_boundary_unrelated_opposing_directives():
+    """Checkpoint C.1 Boundary: Smoking prohibited vs overtime meals permitted -> no false conflict."""
+    from backend.rag import generate_rag_answer
+    from backend.models import SearchPassageResponse
+
+    p1 = SearchPassageResponse(
+        chunk_id="chunk-b4a",
+        document_id="doc-rules",
+        document_title="Facility Rules",
+        page_number=1,
+        chunk_index=0,
+        text="Smoking is strictly prohibited inside the corporate facility.",
+        score=0.72,
+        metadata={},
+    )
+    p2 = SearchPassageResponse(
+        chunk_id="chunk-b4b",
+        document_id="doc-policy",
+        document_title="Expense Policy",
+        page_number=1,
+        chunk_index=0,
+        text="Overtime meals are permitted and reimbursable with prior manager approval.",
+        score=0.84,
+        metadata={},
+    )
+
+    res = generate_rag_answer("Are overtime meals permitted?", [p1, p2])
+    assert res.insufficient_evidence is False
+    assert "conflicting" not in res.answer.lower()
+    assert "permitted" in res.answer.lower()
+    assert len(res.citations) == 1
+    assert res.citations[0].chunk_id == "chunk-b4b"

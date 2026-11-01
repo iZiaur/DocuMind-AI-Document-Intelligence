@@ -1,0 +1,387 @@
+{
+  "version": "1.0.0",
+  "description": "DocuMind AI Stage 5 Standard Evaluation Benchmark Dataset",
+  "total_cases": 25,
+  "categories": [
+    "direct_factual",
+    "paraphrased",
+    "multi_passage",
+    "conflicting_ambiguous",
+    "unanswerable_abstention",
+    "distractor_false_friends"
+  ],
+  "cases": [
+    {
+      "id": "eval-001",
+      "category": "direct_factual",
+      "question": "What is the executive notification deadline for Severity-1 incidents?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Information Security & Incident Response Policy",
+          "page_number": 1
+        }
+      ],
+      "reference_answer": "Severity-1 incidents require executive notification within 15 minutes of detection.",
+      "key_facts": ["15 minutes", "executive notification"],
+      "grading_criteria": "Must mention 15 minutes for executive notification."
+    },
+    {
+      "id": "eval-002",
+      "category": "direct_factual",
+      "question": "What is the maximum domestic per diem cap for daily meal expenses?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Corporate Travel & Expense Reimbursement Policy",
+          "page_number": 2
+        }
+      ],
+      "reference_answer": "The maximum domestic per diem for meals is capped at $75 per day ($20 breakfast, $25 lunch, $30 dinner).",
+      "key_facts": ["$75", "per day"],
+      "grading_criteria": "Must identify $75 per day as the domestic meal per diem limit."
+    },
+    {
+      "id": "eval-003",
+      "category": "direct_factual",
+      "question": "How quickly must a Root Cause Analysis (RCA) document be submitted after incident resolution?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Information Security & Incident Response Policy",
+          "page_number": 4
+        }
+      ],
+      "reference_answer": "The formalized Root Cause Analysis (RCA) must be submitted within 72 hours of incident resolution.",
+      "key_facts": ["72 hours", "incident resolution"],
+      "grading_criteria": "Must state 72 hours from incident resolution."
+    },
+    {
+      "id": "eval-004",
+      "category": "direct_factual",
+      "question": "What is the mandatory staging soak time required before production deployment?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Engineering & Cloud Deployment Guide",
+          "page_number": 1
+        }
+      ],
+      "reference_answer": "Merged code must undergo a mandatory staging soak time of at least 2 hours with zero error alerts before production rollout.",
+      "key_facts": ["2 hours", "staging soak"],
+      "grading_criteria": "Must state at least 2 hours of staging soak time."
+    },
+    {
+      "id": "eval-005",
+      "category": "direct_factual",
+      "question": "What is the minimum password length requirement and how often must passwords be rotated?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Information Security & Incident Response Policy",
+          "page_number": 2
+        }
+      ],
+      "reference_answer": "User passwords must be at least 14 characters long and must be rotated every 90 days.",
+      "key_facts": ["14 characters", "90 days"],
+      "grading_criteria": "Must state at least 14 characters and rotation every 90 days."
+    },
+    {
+      "id": "eval-006",
+      "category": "direct_factual",
+      "question": "What is the standard nightly hotel rate cap for non-metropolitan travel destinations?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Corporate Travel & Expense Reimbursement Policy",
+          "page_number": 2
+        }
+      ],
+      "reference_answer": "Hotel lodging rates are capped at $250 per night excluding taxes in standard non-metropolitan regions.",
+      "key_facts": ["$250", "per night"],
+      "grading_criteria": "Must state $250 per night for standard regions."
+    },
+    {
+      "id": "eval-007",
+      "category": "paraphrased",
+      "question": "How soon must executive leadership be alerted when a critical security emergency occurs?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Information Security & Incident Response Policy",
+          "page_number": 1
+        }
+      ],
+      "reference_answer": "Executive leadership must be notified within 15 minutes of detection for critical Severity-1 incidents.",
+      "key_facts": ["15 minutes"],
+      "grading_criteria": "Must state 15 minutes."
+    },
+    {
+      "id": "eval-008",
+      "category": "paraphrased",
+      "question": "What is the daily spending ceiling for food while traveling on business within the country?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Corporate Travel & Expense Reimbursement Policy",
+          "page_number": 2
+        }
+      ],
+      "reference_answer": "The maximum domestic meal reimbursement is capped at $75 per day.",
+      "key_facts": ["$75"],
+      "grading_criteria": "Must state $75 per day."
+    },
+    {
+      "id": "eval-009",
+      "category": "paraphrased",
+      "question": "How long must newly merged software run in pre-production staging before rolling out to live users?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Engineering & Cloud Deployment Guide",
+          "page_number": 1
+        }
+      ],
+      "reference_answer": "Software must run in the staging environment for at least 2 hours with zero error alerts before production deployment.",
+      "key_facts": ["2 hours", "staging"],
+      "grading_criteria": "Must state at least 2 hours."
+    },
+    {
+      "id": "eval-010",
+      "category": "paraphrased",
+      "question": "What is the mandatory storage period for corporate security audit logs?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Information Security & Incident Response Policy",
+          "page_number": 3
+        }
+      ],
+      "reference_answer": "Audit logs and compliance records must be retained for exactly seven years in immutable WORM storage.",
+      "key_facts": ["seven years"],
+      "grading_criteria": "Must state seven years."
+    },
+    {
+      "id": "eval-011",
+      "category": "multi_passage",
+      "question": "What are the peer review requirements for pull requests and the post-incident RCA submission deadline?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Engineering & Cloud Deployment Guide",
+          "page_number": 1
+        },
+        {
+          "document_title": "Information Security & Incident Response Policy",
+          "page_number": 4
+        }
+      ],
+      "reference_answer": "Pull requests require at least two peer code reviews before merge, and the Root Cause Analysis (RCA) must be submitted within 72 hours of incident resolution.",
+      "key_facts": ["two peer", "72 hours"],
+      "grading_criteria": "Must combine facts from both documents: 2 peer reviews and 72-hour RCA deadline."
+    },
+    {
+      "id": "eval-012",
+      "category": "multi_passage",
+      "question": "What approval is required for a flight exceeding $1,500 and what is the deadline to file the expense report?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Corporate Travel & Expense Reimbursement Policy",
+          "page_number": 1
+        },
+        {
+          "document_title": "Corporate Travel & Expense Reimbursement Policy",
+          "page_number": 3
+        }
+      ],
+      "reference_answer": "Flights exceeding $1,500 require prior written approval from a Vice President, and expense reports must be submitted within 30 calendar days.",
+      "key_facts": ["Vice President", "30", "days"],
+      "grading_criteria": "Must mention VP approval and 30 calendar days."
+    },
+    {
+      "id": "eval-013",
+      "category": "multi_passage",
+      "question": "How long are daily database backups kept and where must database rollback scripts be verified?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Information Security & Incident Response Policy",
+          "page_number": 3
+        },
+        {
+          "document_title": "Engineering & Cloud Deployment Guide",
+          "page_number": 2
+        }
+      ],
+      "reference_answer": "Daily database snapshots are retained for 30 days, and rollback scripts must be verified in the staging environment before production rollout.",
+      "key_facts": ["30 days", "staging"],
+      "grading_criteria": "Must mention 30-day retention and staging verification."
+    },
+    {
+      "id": "eval-014",
+      "category": "conflicting_ambiguous",
+      "question": "Can an employee receive reimbursement if an expense was approved verbally by a manager?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Corporate Travel & Expense Reimbursement Policy",
+          "page_number": 3
+        }
+      ],
+      "reference_answer": "No, verbal approvals are strictly prohibited for any expense claim regardless of amount; all approvals must be documented digitally in the portal.",
+      "key_facts": ["prohibited", "verbal"],
+      "grading_criteria": "Must explicitly state that verbal approvals are prohibited or not allowed."
+    },
+    {
+      "id": "eval-015",
+      "category": "conflicting_ambiguous",
+      "question": "Can engineering teams deploy a routine production update on Friday at 3:00 PM?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Engineering & Cloud Deployment Guide",
+          "page_number": 1
+        }
+      ],
+      "reference_answer": "No, production deployments are strictly prohibited on Fridays after 2:00 PM local time.",
+      "key_facts": ["prohibited", "2:00 PM"],
+      "grading_criteria": "Must state that Friday deployments after 2:00 PM are prohibited."
+    },
+    {
+      "id": "eval-016",
+      "category": "conflicting_ambiguous",
+      "question": "Is alcohol reimbursable as part of an employee's dinner meal per diem while traveling?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Corporate Travel & Expense Reimbursement Policy",
+          "page_number": 2
+        }
+      ],
+      "reference_answer": "No, alcoholic beverages are strictly non-reimbursable under standard individual meal expenses.",
+      "key_facts": ["non-reimbursable", "alcohol"],
+      "grading_criteria": "Must state that alcohol is non-reimbursable."
+    },
+    {
+      "id": "eval-017",
+      "category": "unanswerable_abstention",
+      "question": "What is the corporate reimbursement limit for personal gym memberships and fitness wellness programs?",
+      "is_answerable": false,
+      "expected_abstention": true,
+      "expected_evidence": [],
+      "reference_answer": "I do not have sufficient information in the provided documents to answer this question.",
+      "key_facts": ["sufficient information"],
+      "grading_criteria": "Must abstain cleanly with no false claims."
+    },
+    {
+      "id": "eval-018",
+      "category": "unanswerable_abstention",
+      "question": "How many weeks of fully paid parental leave are employees eligible to receive?",
+      "is_answerable": false,
+      "expected_abstention": true,
+      "expected_evidence": [],
+      "reference_answer": "I do not have sufficient information in the provided documents to answer this question.",
+      "key_facts": ["sufficient information"],
+      "grading_criteria": "Must abstain cleanly."
+    },
+    {
+      "id": "eval-019",
+      "category": "unanswerable_abstention",
+      "question": "What is the four-year vesting schedule and cliff period for employee stock options?",
+      "is_answerable": false,
+      "expected_abstention": true,
+      "expected_evidence": [],
+      "reference_answer": "I do not have sufficient information in the provided documents to answer this question.",
+      "key_facts": ["sufficient information"],
+      "grading_criteria": "Must abstain cleanly."
+    },
+    {
+      "id": "eval-020",
+      "category": "unanswerable_abstention",
+      "question": "What mobile framework is used for the DocuMind iOS application?",
+      "is_answerable": false,
+      "expected_abstention": true,
+      "expected_evidence": [],
+      "reference_answer": "I do not have sufficient information in the provided documents to answer this question.",
+      "key_facts": ["sufficient information"],
+      "grading_criteria": "Must abstain cleanly."
+    },
+    {
+      "id": "eval-021",
+      "category": "unanswerable_abstention",
+      "question": "What are the rules regarding bringing pet dogs into corporate office buildings?",
+      "is_answerable": false,
+      "expected_abstention": true,
+      "expected_evidence": [],
+      "reference_answer": "I do not have sufficient information in the provided documents to answer this question.",
+      "key_facts": ["sufficient information"],
+      "grading_criteria": "Must abstain cleanly."
+    },
+    {
+      "id": "eval-022",
+      "category": "distractor_false_friends",
+      "question": "What is the executive notification deadline for Severity-4 informational security notices?",
+      "is_answerable": false,
+      "expected_abstention": true,
+      "expected_evidence": [],
+      "reference_answer": "I do not have sufficient information in the provided documents to answer this question.",
+      "key_facts": ["sufficient information"],
+      "grading_criteria": "Must abstain; Severity-4 does not exist in the policy, even though Sev-1, 2, and 3 are discussed."
+    },
+    {
+      "id": "eval-023",
+      "category": "distractor_false_friends",
+      "question": "Are itemized receipts mandatory for taxi rides that cost exactly fifteen dollars?",
+      "is_answerable": true,
+      "expected_abstention": false,
+      "expected_evidence": [
+        {
+          "document_title": "Corporate Travel & Expense Reimbursement Policy",
+          "page_number": 3
+        }
+      ],
+      "reference_answer": "No, itemized receipts are only mandatory for expenses exceeding $25, so an expense of $15 does not strictly require one.",
+      "key_facts": ["exceeding $25"],
+      "grading_criteria": "Must note that receipts are mandatory only for expenses exceeding $25."
+    },
+    {
+      "id": "eval-024",
+      "category": "distractor_false_friends",
+      "question": "What is the on-call acknowledgement deadline for low-priority informational alerts?",
+      "is_answerable": false,
+      "expected_abstention": true,
+      "expected_evidence": [],
+      "reference_answer": "I do not have sufficient information in the provided documents to answer this question.",
+      "key_facts": ["sufficient information"],
+      "grading_criteria": "Must abstain; only high-priority alerts specify a 10-minute acknowledgement window."
+    },
+    {
+      "id": "eval-025",
+      "category": "distractor_false_friends",
+      "question": "What is the retention duration for temporary personal staging database snapshots?",
+      "is_answerable": false,
+      "expected_abstention": true,
+      "expected_evidence": [],
+      "reference_answer": "I do not have sufficient information in the provided documents to answer this question.",
+      "key_facts": ["sufficient information"],
+      "grading_criteria": "Must abstain; policy covers automated daily backups and monthly archives, not personal staging snapshots."
+    }
+  ]
+}
