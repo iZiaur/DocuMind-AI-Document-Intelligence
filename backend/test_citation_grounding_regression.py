@@ -194,3 +194,112 @@ def test_format_context_prompt_includes_index_and_attributes(remote_work_passage
     assert '<passage id="chunk-meta-001" index="1" document="Enterprise Remote Work Policy" page="1">' in prompt
     assert '<passage id="chunk-onboarding-002" index="2" document="Enterprise Remote Work Policy" page="2">' in prompt
     assert '<passage id="chunk-remote-rules-003" index="3" document="Enterprise Remote Work Policy" page="2">' in prompt
+
+
+def test_deployed_issue_reproduction_clean_answer_and_valid_citation(remote_work_passages):
+    """
+    Direct test for the observed issue:
+    Input answer: 'Employees may work remotely up to three days per week with manager approval [source: 1, 3].'
+    Verifies:
+    1. '[source: 1, 3]' marker is completely stripped from clean_answer.
+    2. clean_answer equals 'Employees may work remotely up to three days per week with manager approval.'
+    3. Exactly 1 citation (chunk-remote-rules-003) is retained because chunk-meta-001 (passage 1) is metadata.
+    4. Excerpt contains the exact supporting sentence.
+    """
+    raw_answer = "Employees may work remotely up to three days per week with manager approval [source: 1, 3]."
+    citations, clean_ans = validate_and_extract_citations(raw_answer, remote_work_passages)
+
+    assert clean_ans == "Employees may work remotely up to three days per week with manager approval."
+    assert "[source:" not in clean_ans
+    assert len(citations) == 1
+    assert citations[0].chunk_id == "chunk-remote-rules-003"
+    assert "three days per week with manager approval" in citations[0].excerpt
+
+
+def test_remove_citation_marker_various_formats(remote_work_passages):
+    """
+    Verifies stripping of all supported internal citation formats:
+    - [source: 1]
+    - [source: 1, 3]
+    - [passage 1]
+    - [passages: 1, 2]
+    - [source: <UUID>]
+    - [<UUID>]
+    - [1]
+    - [1, 3]
+    """
+    cases = [
+        (
+            "Employees may work remotely up to three days per week [source: 3].",
+            "Employees may work remotely up to three days per week.",
+        ),
+        (
+            "Employees may work remotely up to three days per week [source: 1, 3].",
+            "Employees may work remotely up to three days per week.",
+        ),
+        (
+            "Employees may work remotely up to three days per week [passage 3].",
+            "Employees may work remotely up to three days per week.",
+        ),
+        (
+            "Employees may work remotely up to three days per week [passages: 1, 3].",
+            "Employees may work remotely up to three days per week.",
+        ),
+        (
+            "Employees may work remotely up to three days per week [source: chunk-remote-rules-003].",
+            "Employees may work remotely up to three days per week.",
+        ),
+        (
+            "Employees may work remotely up to three days per week [chunk-remote-rules-003].",
+            "Employees may work remotely up to three days per week.",
+        ),
+        (
+            "Employees may work remotely up to three days per week [3].",
+            "Employees may work remotely up to three days per week.",
+        ),
+        (
+            "Employees may work remotely up to three days per week [1, 3].",
+            "Employees may work remotely up to three days per week.",
+        ),
+    ]
+
+    for raw, expected in cases:
+        citations, clean_ans = validate_and_extract_citations(raw, remote_work_passages)
+        assert clean_ans == expected, f"Failed on {raw}: got {clean_ans!r}"
+        assert len(citations) >= 1
+        assert citations[0].chunk_id == "chunk-remote-rules-003"
+
+
+def test_preserve_ordinary_bracketed_text(remote_work_passages):
+    """
+    Verifies that legitimate, non-citation bracketed content in generated answers is preserved:
+    - [Note: manager approval required]
+    - [e.g., domestic travel]
+    - [SOC 2 Type II]
+    - [2024]
+    """
+    answer_with_note = (
+        "Employees may work remotely up to three days per week [Note: manager approval required] "
+        "[source: chunk-remote-rules-003]."
+    )
+    citations, clean_ans = validate_and_extract_citations(answer_with_note, remote_work_passages)
+    assert "[Note: manager approval required]" in clean_ans
+    assert "[source:" not in clean_ans
+    assert len(citations) == 1
+
+    answer_with_eg = (
+        "Employees may work remotely up to three days per week [e.g., Tuesday through Thursday] [3]."
+    )
+    citations, clean_ans = validate_and_extract_citations(answer_with_eg, remote_work_passages)
+    assert "[e.g., Tuesday through Thursday]" in clean_ans
+    assert "[3]" not in clean_ans
+
+    answer_with_soc = "The system is compliant with [SOC 2 Type II] standards [source: chunk-remote-rules-003]."
+    citations, clean_ans = validate_and_extract_citations(answer_with_soc, remote_work_passages)
+    assert "[SOC 2 Type II]" in clean_ans
+    assert "[source:" not in clean_ans
+
+    answer_with_year = "The policy was instituted in [2024] [source: chunk-remote-rules-003]."
+    citations, clean_ans = validate_and_extract_citations(answer_with_year, remote_work_passages)
+    assert "[2024]" in clean_ans
+    assert "[source:" not in clean_ans

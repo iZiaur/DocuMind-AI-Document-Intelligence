@@ -562,8 +562,8 @@ def extract_sentence_excerpt(passage_text: str, best_sentence: str, max_len: int
 
 
 METADATA_INDICATORS = {
-    "document id", "effective date", "applicability", "policy title", "document title",
-    "version", "revision", "confidentiality", "all rights reserved", "page 1 of",
+    "document id", "doc id", "effective date", "applicability", "policy title", "document title",
+    "version", "revision", "confidentiality", "all rights reserved", "page 1 of", "title:",
 }
 
 
@@ -599,7 +599,7 @@ def score_passage_against_answer(
         s_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-]+\b", s_lower))
 
         # Check metadata header penalty
-        is_meta = any(mi in s_lower for mi in METADATA_INDICATORS)
+        is_meta = any(mi in s_lower for mi in METADATA_INDICATORS) or s_lower.strip().startswith("title:") or s_lower.strip().startswith("title :")
         meta_penalty = -8.0 if is_meta else 0.0
 
         # Term overlap
@@ -672,6 +672,66 @@ def format_context_prompt(passages: List[SearchPassageResponse]) -> str:
     return "\n".join(context_lines)
 
 
+def clean_citation_markers_and_extract_tags(
+    text: str,
+    valid_ids: Set[str],
+    valid_indices: Set[str],
+) -> Tuple[str, List[str]]:
+    """
+    Strips internal citation markers from LLM output while preserving normal bracketed text.
+    Handles:
+    - [source: 1], [source: 1, 3], [sources: 1, 2]
+    - [passage 1], [passages: 1, 3], [p1], [p.1]
+    - [source: <UUID>], [<UUID>]
+    - Bare indices: [1], [1, 3], [1, 2, 3]
+    Preserves:
+    - [Note: ...], [e.g. ...], [i.e. ...], [SOC 2], [2024], etc.
+    Returns: (cleaned_text, list_of_extracted_id_or_index_tokens)
+    """
+    found_tokens: List[str] = []
+
+    def repl(m: re.Match) -> str:
+        inner = m.group(1).strip()
+
+        # 1. Check for explicit citation prefixes: source(s):, passage(s):, doc(s):, p:, p.
+        prefix_match = re.match(
+            r"^(?:sources?|passages?|docs?|p\.?)\s*[:\s]\s*(.+)$",
+            inner,
+            re.IGNORECASE,
+        )
+        if prefix_match:
+            rest = prefix_match.group(1)
+            parts = re.split(r"[,;\s]+", rest.strip())
+            for part in parts:
+                clean_part = part.strip()
+                if clean_part:
+                    found_tokens.append(clean_part)
+            return ""
+
+        # 2. Check for bare UUID (standard 8-4-4-4-12 hex or chunk ID known in valid_ids)
+        is_uuid = bool(re.match(r"^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$", inner, re.IGNORECASE))
+        if is_uuid or inner in valid_ids:
+            found_tokens.append(inner)
+            return ""
+
+        # 3. Check for bare passage index or list of indices (e.g. '1' or '1, 3')
+        parts = [p.strip() for p in re.split(r"[,;\s]+", inner) if p.strip()]
+        if parts and all(p.isdigit() for p in parts):
+            if any(p in valid_indices for p in parts) or all(int(p) <= 20 for p in parts):
+                for p in parts:
+                    found_tokens.append(p)
+                return ""
+
+        # Otherwise preserve ordinary bracketed content
+        return m.group(0)
+
+    cleaned = re.sub(r"\s*\[([^\]]+)\]", repl, text).strip()
+    cleaned = re.sub(r"\s+([.,!?;:])", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+
+    return cleaned, found_tokens
+
+
 def validate_and_extract_citations(
     llm_output: str,
     retrieved_passages: List[SearchPassageResponse],
@@ -690,24 +750,17 @@ def validate_and_extract_citations(
     if is_insufficient is None:
         is_insufficient = is_refusal_or_insufficient_answer(llm_output)
 
-    # Clean the raw text of bracketed citation markers for display
-    clean_answer = re.sub(
-        r"\s*\[(?:source:\s*|passage:\s*|p)?([a-zA-Z0-9_\-]{1,64})\]", "", llm_output, flags=re.IGNORECASE
-    ).strip()
-    clean_answer = re.sub(r"\s+([.,!?;:])", r"\1", clean_answer)
-    clean_answer = re.sub(r"[ \t]+", " ", clean_answer)
+    valid_passages_by_id = {str(p.chunk_id): p for p in retrieved_passages}
+    valid_passages_by_idx = {str(i + 1): p for i, p in enumerate(retrieved_passages)}
+
+    # Clean the raw text of bracketed citation markers for display while extracting tokens
+    clean_answer, found_tags = clean_citation_markers_and_extract_tags(
+        llm_output, set(valid_passages_by_id.keys()), set(valid_passages_by_idx.keys())
+    )
 
     # If the answer is an explicit refusal / insufficient evidence, return NO citations
     if is_insufficient or not retrieved_passages:
         return [], clean_answer
-
-    valid_passages_by_id = {str(p.chunk_id): p for p in retrieved_passages}
-    valid_passages_by_idx = {str(i + 1): p for i, p in enumerate(retrieved_passages)}
-
-    # Find explicit citations: [source: <id>], [passage: <id>], or [<id>]
-    found_tags = re.findall(
-        r"\[(?:source:\s*|passage:\s*|p)?([a-zA-Z0-9_\-]{1,64})\]", llm_output, flags=re.IGNORECASE
-    )
 
     explicit_passages: List[SearchPassageResponse] = []
     seen_explicit_cids = set()
@@ -734,10 +787,18 @@ def validate_and_extract_citations(
     validated_citations: List[Citation] = []
 
     if explicit_passages:
-        # Verify that explicitly cited passages have substantive grounding (score >= 2.0)
+        # Score each explicitly cited passage against the substantive answer
+        scored_explicit: List[Tuple[float, str, Set[str], SearchPassageResponse]] = []
         for ep in explicit_passages:
-            ep_score, ep_sent, _ = score_passage_against_answer(ep, clean_answer)
-            if ep_score >= 2.0:
+            ep_score, ep_sent, ep_terms = score_passage_against_answer(ep, clean_answer)
+            # Require positive score (non-metadata) and substantive term overlap
+            if ep_score >= 3.0 and len(ep_terms) >= 2:
+                scored_explicit.append((ep_score, ep_sent, ep_terms, ep))
+
+        if scored_explicit:
+            # Sort explicitly cited passages by support score descending
+            scored_explicit.sort(key=lambda x: x[0], reverse=True)
+            for ep_score, ep_sent, ep_terms, ep in scored_explicit:
                 validated_citations.append(
                     Citation(
                         chunk_id=ep.chunk_id,
@@ -748,7 +809,8 @@ def validate_and_extract_citations(
                         score=ep.score,
                     )
                 )
-        if validated_citations:
+                if len(validated_citations) >= 2:
+                    break
             return validated_citations, clean_answer
 
     # Grounding candidate selection from ranked passages
