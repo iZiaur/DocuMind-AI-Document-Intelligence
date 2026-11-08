@@ -4,7 +4,7 @@ import uuid
 import logging
 import time
 import math
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 from xml.sax.saxutils import escape
 import httpx
 from dotenv import load_dotenv
@@ -215,8 +215,8 @@ CRITICAL SECURITY, GROUNDING & ABSTENTION INSTRUCTIONS:
    - Never extrapolate, speculate, or substitute a different identifier, tier, status, or amount (e.g., if asked for Severity-4 or low-priority, do NOT substitute Severity-1 or high-priority).
    - If the question contains multiple parts and only some parts are supported, clearly answer the supported part with its citation, and explicitly state that the other part is not addressed in the provided documents.
    - If the retrieved passages contain conflicting information regarding a topic, explicitly explain the conflict and cite both sources rather than presenting an unsupported resolution.
-3. CITATIONS: Whenever you state a fact derived from a passage, cite it using the exact chunk ID in brackets, e.g. [source: <chunk_id>].
-   Only cite IDs that are explicitly provided in the <context>. Do not fabricate source IDs.
+3. CITATIONS: Whenever you state a fact derived from a passage, cite it using the passage index or chunk ID in brackets, e.g. [source: <chunk_id>] or [1].
+   Only cite passages that are explicitly provided in the <context>. Do not fabricate source IDs.
    When stating that information is insufficient or not available, do NOT include citations.
 """
 
@@ -530,10 +530,123 @@ def assess_evidence_sufficiency(
     return True, "Sufficient evidence found.", scored_candidates
 
 
+def extract_sentence_excerpt(passage_text: str, best_sentence: str, max_len: int = 220) -> str:
+    """
+    Extracts an excerpt of at most max_len characters from passage_text centered around best_sentence.
+    Preserves context around the actual evidence rather than blindly slicing from the start of the chunk.
+    """
+    clean_text = passage_text.strip()
+    if len(clean_text) <= max_len:
+        return clean_text
+
+    idx = clean_text.find(best_sentence)
+    if idx == -1:
+        # Fallback to prefix
+        return clean_text[:max_len] + "..."
+
+    # If the sentence fits comfortably near the start
+    if idx + len(best_sentence) <= max_len:
+        cut = clean_text[:max_len].rsplit(" ", 1)[0]
+        return cut + "..."
+
+    # Center a window around the best sentence
+    margin = max(10, (max_len - len(best_sentence)) // 2) if len(best_sentence) < max_len else 15
+    start = max(0, idx - margin)
+    end = min(len(clean_text), start + max_len - 6)
+    excerpt = clean_text[start:end].strip()
+    if start > 0:
+        excerpt = "..." + excerpt
+    if end < len(clean_text):
+        excerpt = excerpt + "..."
+    return excerpt
+
+
+METADATA_INDICATORS = {
+    "document id", "effective date", "applicability", "policy title", "document title",
+    "version", "revision", "confidentiality", "all rights reserved", "page 1 of",
+}
+
+
+def score_passage_against_answer(
+    passage: SearchPassageResponse,
+    answer: str,
+) -> Tuple[float, str, Set[str]]:
+    """
+    Evaluates how strongly a retrieved passage substantively grounds and supports an answer.
+    Returns: (support_score, best_supporting_sentence, matched_substantive_terms).
+    """
+    tokens = set(re.findall(r"\b[a-zA-Z0-9_\-]+\b", answer.lower()))
+    substantive_ans = {t for t in tokens if t not in COMMON_STOPWORDS and len(t) > 2}
+    ans_numbers: Set[str] = set()
+    for t in tokens:
+        if t.isdigit():
+            ans_numbers.add(t)
+        elif t in WORD_NUMBERS:
+            ans_numbers.add(str(WORD_NUMBERS[t]))
+            ans_numbers.add(t)
+
+    ans_lower = answer.lower()
+    sentences = re.split(r"(?<=[.!?])\s+", passage.text)
+    best_score = -100.0
+    best_sentence = sentences[0] if sentences else passage.text
+    best_matched_terms: Set[str] = set()
+
+    for s in sentences:
+        s_clean = s.strip()
+        if len(s_clean) < 10:
+            continue
+        s_lower = s_clean.lower()
+        s_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-]+\b", s_lower))
+
+        # Check metadata header penalty
+        is_meta = any(mi in s_lower for mi in METADATA_INDICATORS)
+        meta_penalty = -8.0 if is_meta else 0.0
+
+        # Term overlap
+        matched: Set[str] = set()
+        for at in substantive_ans:
+            at_stem = stem_word(at)
+            if at in s_tokens or at_stem in {stem_word(t) for t in s_tokens} or any(words_match(at, st) for st in s_tokens):
+                matched.add(at)
+
+        score = (len(matched) * 1.5) + meta_penalty
+
+        # Numeric and unit entity alignment
+        s_numbers: Set[str] = set()
+        for t in s_tokens:
+            if t.isdigit():
+                s_numbers.add(t)
+            elif t in WORD_NUMBERS:
+                s_numbers.add(str(WORD_NUMBERS[t]))
+                s_numbers.add(t)
+
+        if ans_numbers:
+            common_nums = ans_numbers & s_numbers
+            if common_nums:
+                score += 5.0
+            elif s_numbers:
+                # Contradictory number in same sentence (e.g. 4 days when answer says 3 days)
+                score -= 3.0
+
+        # Bigram / key phrase bonus (e.g. "three days", "work remotely", "manager approval")
+        ans_words = [w for w in re.findall(r"\w+", ans_lower) if w not in COMMON_STOPWORDS and len(w) > 2]
+        for i in range(len(ans_words) - 1):
+            phrase = f"{ans_words[i]} {ans_words[i+1]}"
+            if phrase in s_lower:
+                score += 2.0
+
+        if score > best_score:
+            best_score = score
+            best_sentence = s_clean
+            best_matched_terms = matched
+
+    return best_score, best_sentence, best_matched_terms
+
+
 def format_context_prompt(passages: List[SearchPassageResponse]) -> str:
     """
     Constructs an isolated, delimited XML-style context block.
-    Explicitly tags each passage with its chunk_id, document title, and page number.
+    Explicitly tags each passage with its 1-based index, chunk_id, document title, and page number.
 
     Defense-in-depth: Escapes XML-special characters in document text and attributes
     (using standard xml.sax.saxutils.escape) to prevent untrusted PDF text from breaking
@@ -544,13 +657,13 @@ def format_context_prompt(passages: List[SearchPassageResponse]) -> str:
         return "<context>\nNo relevant passages found in authorized documents.\n</context>"
 
     context_lines = ["<context>"]
-    for p in passages:
+    for idx, p in enumerate(passages, 1):
         safe_id = escape(str(p.chunk_id), {'"': "&quot;", "'": "&apos;"})
         safe_title = escape(str(p.document_title), {'"': "&quot;", "'": "&apos;"})
         safe_page = escape(str(p.page_number), {'"': "&quot;", "'": "&apos;"})
         safe_text = escape(p.text)
         context_lines.append(
-            f'<passage id="{safe_id}" document="{safe_title}" page="{safe_page}">'
+            f'<passage id="{safe_id}" index="{idx}" document="{safe_title}" page="{safe_page}">'
         )
         context_lines.append(safe_text)
         context_lines.append("</passage>")
@@ -566,147 +679,114 @@ def validate_and_extract_citations(
 ) -> Tuple[List[Citation], str]:
     """
     Security Gate:
-    1. Extracts any citation tokens ([source: <id>] or [<id>]) from model output.
+    1. Extracts any citation tokens ([source: <id>], [<id>], or [1]) from model output.
     2. Validates them strictly against the list of actually retrieved passages for the current request.
     3. Rejects/discards any model-fabricated IDs that were not retrieved.
-    4. Refusal or insufficient-evidence answers never receive fallback citations.
-    5. If the model didn't cite explicitly but provided a positive grounded answer, attaches
-       only those retrieved evidence passages whose substantive content actually relates to the answer.
-       Unrelated passages are never attached as proof of grounding merely because they were retrieved.
+    4. Refusal or insufficient-evidence answers never receive citations.
+    5. Verifies substantive evidence support: citations must actually contain the facts claimed.
+       Unrelated passages and metadata headers are never presented as supporting citations.
+    6. Multiple citations are only presented if they provide distinct, useful supporting evidence.
     """
     if is_insufficient is None:
         is_insufficient = is_refusal_or_insufficient_answer(llm_output)
 
-    valid_passages_by_id = {p.chunk_id: p for p in retrieved_passages}
-
-    # Find citations in format [source: <id>] or [id]
-    cited_ids = set()
-    found_tags = re.findall(r"\[(?:source:\s*)?([a-zA-Z0-9_\-]{3,64})\]", llm_output, re.IGNORECASE)
-    for tag in found_tags:
-        if tag in valid_passages_by_id:
-            cited_ids.add(tag)
-
     # Clean the raw text of bracketed citation markers for display
-    clean_answer = re.sub(r"\s*\[(?:source:\s*)?[a-zA-Z0-9_\-]{3,64}\]", "", llm_output).strip()
-    clean_answer = re.sub(r"\s+([.,!?;:])", r"\1", clean_answer)
-    clean_answer = re.sub(r"[ \t]+", " ", clean_answer)
-
-
-    scored_candidates.sort(key=lambda x: x[0], reverse=True)
-    return True, "Sufficient evidence found.", scored_candidates
-
-
-def format_context_prompt(passages: List[SearchPassageResponse]) -> str:
-    """
-    Constructs an isolated, delimited XML-style context block.
-    Explicitly tags each passage with its chunk_id, document title, and page number.
-
-    Defense-in-depth: Escapes XML-special characters in document text and attributes
-    (using standard xml.sax.saxutils.escape) to prevent untrusted PDF text from breaking
-    out of the <context> or <passage> delimiters. Delimiter escaping is a structural
-    boundary protection, not a complete prompt-injection defense.
-    """
-    if not passages:
-        return "<context>\nNo relevant passages found in authorized documents.\n</context>"
-
-    context_lines = ["<context>"]
-    for p in passages:
-        safe_id = escape(str(p.chunk_id), {'"': "&quot;", "'": "&apos;"})
-        safe_title = escape(str(p.document_title), {'"': "&quot;", "'": "&apos;"})
-        safe_page = escape(str(p.page_number), {'"': "&quot;", "'": "&apos;"})
-        safe_text = escape(p.text)
-        context_lines.append(
-            f'<passage id="{safe_id}" document="{safe_title}" page="{safe_page}">'
-        )
-        context_lines.append(safe_text)
-        context_lines.append("</passage>")
-    context_lines.append("</context>")
-
-    return "\n".join(context_lines)
-
-
-def validate_and_extract_citations(
-    llm_output: str,
-    retrieved_passages: List[SearchPassageResponse],
-    is_insufficient: Optional[bool] = None,
-) -> Tuple[List[Citation], str]:
-    """
-    Security Gate:
-    1. Extracts any citation tokens ([source: <id>] or [<id>]) from model output.
-    2. Validates them strictly against the list of actually retrieved passages for the current request.
-    3. Rejects/discards any model-fabricated IDs that were not retrieved.
-    4. Refusal or insufficient-evidence answers never receive fallback citations.
-    5. If the model didn't cite explicitly but provided a positive grounded answer, attaches
-       only those retrieved evidence passages whose substantive content actually relates to the answer.
-       Unrelated passages are never attached as proof of grounding merely because they were retrieved.
-    """
-    if is_insufficient is None:
-        is_insufficient = is_refusal_or_insufficient_answer(llm_output)
-
-    valid_passages_by_id = {p.chunk_id: p for p in retrieved_passages}
-
-    # Find citations in format [source: <id>] or [id]
-    cited_ids = set()
-    found_tags = re.findall(r"\[(?:source:\s*)?([a-zA-Z0-9_\-]{3,64})\]", llm_output, re.IGNORECASE)
-    for tag in found_tags:
-        if tag in valid_passages_by_id:
-            cited_ids.add(tag)
-
-    # Clean the raw text of bracketed citation markers for display
-    clean_answer = re.sub(r"\s*\[(?:source:\s*)?[a-zA-Z0-9_\-]{3,64}\]", "", llm_output).strip()
+    clean_answer = re.sub(
+        r"\s*\[(?:source:\s*|passage:\s*|p)?([a-zA-Z0-9_\-]{1,64})\]", "", llm_output, flags=re.IGNORECASE
+    ).strip()
     clean_answer = re.sub(r"\s+([.,!?;:])", r"\1", clean_answer)
     clean_answer = re.sub(r"[ \t]+", " ", clean_answer)
 
     # If the answer is an explicit refusal / insufficient evidence, return NO citations
-    if is_insufficient:
+    if is_insufficient or not retrieved_passages:
         return [], clean_answer
 
-    validated_citations: List[Citation] = []
-    if cited_ids:
-        # Use only explicitly cited passages that belong to retrieved passages
-        for cid in cited_ids:
-            p = valid_passages_by_id[cid]
-            excerpt = p.text[:220] + "..." if len(p.text) > 220 else p.text
-            validated_citations.append(
-                Citation(
-                    chunk_id=p.chunk_id,
-                    document_id=p.document_id,
-                    document_title=p.document_title,
-                    page_number=p.page_number,
-                    excerpt=excerpt,
-                    score=p.score,
-                )
-            )
-    else:
-        # Fallback association: Only attach retrieved passages that substantively relate to the answer.
-        # Do not attach unrelated passages just because they were retrieved.
-        answer_words = set(re.findall(r"\b[a-zA-Z0-9]{3,}\b", clean_answer.lower()))
-        stop_words = {
-            "the", "and", "that", "this", "with", "from", "for", "have", "were",
-            "which", "there", "their", "they", "been", "about", "would", "could",
-            "what", "when", "where", "also", "into", "more", "some", "such",
-        }
-        substantive_answer_words = answer_words - stop_words
+    valid_passages_by_id = {str(p.chunk_id): p for p in retrieved_passages}
+    valid_passages_by_idx = {str(i + 1): p for i, p in enumerate(retrieved_passages)}
 
-        if substantive_answer_words:
-            for p in retrieved_passages:
-                passage_words = set(re.findall(r"\b[a-zA-Z0-9]{3,}\b", p.text.lower()))
-                # Require meaningful content overlap between the passage and the answer
-                overlap = substantive_answer_words & passage_words
-                if overlap:
-                    excerpt = p.text[:220] + "..." if len(p.text) > 220 else p.text
-                    validated_citations.append(
-                        Citation(
-                            chunk_id=p.chunk_id,
-                            document_id=p.document_id,
-                            document_title=p.document_title,
-                            page_number=p.page_number,
-                            excerpt=excerpt,
-                            score=p.score,
-                        )
+    # Find explicit citations: [source: <id>], [passage: <id>], or [<id>]
+    found_tags = re.findall(
+        r"\[(?:source:\s*|passage:\s*|p)?([a-zA-Z0-9_\-]{1,64})\]", llm_output, flags=re.IGNORECASE
+    )
+
+    explicit_passages: List[SearchPassageResponse] = []
+    seen_explicit_cids = set()
+    for tag in found_tags:
+        p = None
+        if tag in valid_passages_by_id:
+            p = valid_passages_by_id[tag]
+        elif tag in valid_passages_by_idx:
+            p = valid_passages_by_idx[tag]
+
+        if p and p.chunk_id not in seen_explicit_cids:
+            seen_explicit_cids.add(p.chunk_id)
+            explicit_passages.append(p)
+
+    # Score each retrieved passage against the substantive answer
+    passage_scores: List[Tuple[float, str, Set[str], SearchPassageResponse]] = []
+    for p in retrieved_passages:
+        score, best_sent, matched_terms = score_passage_against_answer(p, clean_answer)
+        passage_scores.append((score, best_sent, matched_terms, p))
+
+    # Sort descending by support score
+    passage_scores.sort(key=lambda x: x[0], reverse=True)
+
+    validated_citations: List[Citation] = []
+
+    if explicit_passages:
+        # Verify that explicitly cited passages have substantive grounding (score >= 2.0)
+        for ep in explicit_passages:
+            ep_score, ep_sent, _ = score_passage_against_answer(ep, clean_answer)
+            if ep_score >= 2.0:
+                validated_citations.append(
+                    Citation(
+                        chunk_id=ep.chunk_id,
+                        document_id=ep.document_id,
+                        document_title=ep.document_title,
+                        page_number=ep.page_number,
+                        excerpt=extract_sentence_excerpt(ep.text, ep_sent),
+                        score=ep.score,
                     )
-                    if len(validated_citations) >= 2:
-                        break
+                )
+        if validated_citations:
+            return validated_citations, clean_answer
+
+    # Grounding candidate selection from ranked passages
+    # Threshold for substantive support: score >= 3.0 and at least 2 substantive matched terms
+    qualifying = [ps for ps in passage_scores if ps[0] >= 3.0 and len(ps[2]) >= 2]
+
+    if qualifying:
+        top_score, top_sent, top_terms, top_p = qualifying[0]
+        top_excerpt = extract_sentence_excerpt(top_p.text, top_sent)
+        validated_citations.append(
+            Citation(
+                chunk_id=top_p.chunk_id,
+                document_id=top_p.document_id,
+                document_title=top_p.document_title,
+                page_number=top_p.page_number,
+                excerpt=top_excerpt,
+                score=top_p.score,
+            )
+        )
+
+        covered_terms = set(top_terms)
+        for score, best_sent, matched_terms, p in qualifying[1:]:
+            # Only attach secondary citation if it provides distinct supporting terms / claims
+            novel_terms = matched_terms - covered_terms
+            if len(novel_terms) >= 2 and score >= 4.0:
+                validated_citations.append(
+                    Citation(
+                        chunk_id=p.chunk_id,
+                        document_id=p.document_id,
+                        document_title=p.document_title,
+                        page_number=p.page_number,
+                        excerpt=extract_sentence_excerpt(p.text, best_sent),
+                        score=p.score,
+                    )
+                )
+                covered_terms.update(novel_terms)
+                if len(validated_citations) >= 2:
+                    break
 
     return validated_citations, clean_answer
 
