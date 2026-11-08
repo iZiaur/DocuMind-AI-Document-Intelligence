@@ -2098,7 +2098,7 @@ export default function App() {
                       Upload PDF
                     </button>
                     <a
-                      href="http://localhost:8000/docs"
+                      href="https://documind-ai-backend-jhug.onrender.com/docs"
                       target="_blank"
                       rel="noreferrer"
                       className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-300 text-xs font-semibold border border-slate-700 transition"

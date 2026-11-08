@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/api",
+      "destination": "https://documind-ai-backend-jhug.onrender.com/api"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "https://documind-ai-backend-jhug.onrender.com/api/:path*"
+    }
+  ]
+}
